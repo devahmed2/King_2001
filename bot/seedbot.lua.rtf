@@ -1,0 +1,699 @@
+{\rtf1\fbidis\ansi\deff0{\fonttbl{\f0\fnil\fcharset0 Calibri;}}
+{\colortbl ;\red0\green0\blue255;}
+{\*\generator Msftedit 5.41.21.2510;}\viewkind4\uc1\pard\ltrpar\sa200\sl276\slmult1\lang9\f0\fs22 package.path = package.path .. ';.luarocks/share/lua/5.2/?.lua'\par
+  ..';.luarocks/share/lua/5.2/?/init.lua'\par
+package.cpath = package.cpath .. ';.luarocks/lib/lua/5.2/?.so'\par
+\par
+require("./bot/utils")\par
+\par
+local f = assert(io.popen('/usr/bin/git describe --tags', 'r'))\par
+VERSION = assert(f:read('*a'))\par
+f:close()\par
+\par
+-- This function is called when tg receive a msg\par
+function on_msg_receive (msg)\par
+  if not started then\par
+    return\par
+  end\par
+\par
+  msg = backward_msg_format(msg)\par
+\par
+  local receiver = get_receiver(msg)\par
+  print(receiver)\par
+  --vardump(msg)\par
+  --vardump(msg)\par
+  msg = pre_process_service_msg(msg)\par
+  if msg_valid(msg) then\par
+    msg = pre_process_msg(msg)\par
+    if msg then\par
+      match_plugins(msg)\par
+      if redis:get("bot:markread") then\par
+        if redis:get("bot:markread") == "on" then\par
+          mark_read(receiver, ok_cb, false)\par
+        end\par
+      end\par
+    end\par
+  end\par
+end\par
+\par
+function ok_cb(extra, success, result)\par
+\par
+end\par
+\par
+function on_binlog_replay_end()\par
+  started = true\par
+  postpone (cron_plugins, false, 60*5.0)\par
+  -- See plugins/isup.lua as an example for cron\par
+\par
+  _config = load_config()\par
+\par
+  -- load plugins\par
+  plugins = \{\}\par
+  load_plugins()\par
+end\par
+\par
+function msg_valid(msg)\par
+  -- Don't process outgoing messages\par
+  if msg.out then\par
+    print('\\27[36mNot valid: msg from us\\27[39m')\par
+    return false\par
+  end\par
+\par
+  -- Before bot was started\par
+  if msg.date < os.time() - 5 then\par
+    print('\\27[36mNot valid: old msg\\27[39m')\par
+    return false\par
+  end\par
+\par
+  if msg.unread == 0 then\par
+    print('\\27[36mNot valid: readed\\27[39m')\par
+    return false\par
+  end\par
+\par
+  if not msg.to.id then\par
+    print('\\27[36mNot valid: To id not provided\\27[39m')\par
+    return false\par
+  end\par
+\par
+  if not msg.from.id then\par
+    print('\\27[36mNot valid: From id not provided\\27[39m')\par
+    return false\par
+  end\par
+\par
+  if msg.from.id == our_id then\par
+    print('\\27[36mNot valid: Msg from our id\\27[39m')\par
+    return false\par
+  end\par
+\par
+  if msg.to.type == 'encr_chat' then\par
+    print('\\27[36mNot valid: Encrypted chat\\27[39m')\par
+    return false\par
+  end\par
+\par
+  if msg.from.id == 777000 then\par
+    --send_large_msg(*group id*, msg.text) *login code will be sent to GroupID*\par
+    return false\par
+  end\par
+\par
+  return true\par
+end\par
+\par
+--\par
+function pre_process_service_msg(msg)\par
+   if msg.service then\par
+      local action = msg.action or \{type=""\}\par
+      -- Double ! to discriminate of normal actions\par
+      msg.text = "!!tgservice " .. action.type\par
+\par
+      -- wipe the data to allow the bot to read service messages\par
+      if msg.out then\par
+         msg.out = false\par
+      end\par
+      if msg.from.id == our_id then\par
+         msg.from.id = 0\par
+      end\par
+   end\par
+   return msg\par
+end\par
+\par
+-- Apply plugin.pre_process function\par
+function pre_process_msg(msg)\par
+  for name,plugin in pairs(plugins) do\par
+    if plugin.pre_process and msg then\par
+      print('Preprocess', name)\par
+      msg = plugin.pre_process(msg)\par
+    end\par
+  end\par
+  return msg\par
+end\par
+\par
+-- Go over enabled plugins patterns.\par
+function match_plugins(msg)\par
+  for name, plugin in pairs(plugins) do\par
+    match_plugin(plugin, name, msg)\par
+  end\par
+end\par
+\par
+-- Check if plugin is on _config.disabled_plugin_on_chat table\par
+local function is_plugin_disabled_on_chat(plugin_name, receiver)\par
+  local disabled_chats = _config.disabled_plugin_on_chat\par
+  -- Table exists and chat has disabled plugins\par
+  if disabled_chats and disabled_chats[receiver] then\par
+    -- Checks if plugin is disabled on this chat\par
+    for disabled_plugin,disabled in pairs(disabled_chats[receiver]) do\par
+      if disabled_plugin == plugin_name and disabled then\par
+        local warning = 'Plugin '..disabled_plugin..' is disabled on this chat'\par
+        print(warning)\par
+        send_msg(receiver, warning, ok_cb, false)\par
+        return true\par
+      end\par
+    end\par
+  end\par
+  return false\par
+end\par
+\par
+function match_plugin(plugin, plugin_name, msg)\par
+  local receiver = get_receiver(msg)\par
+\par
+  -- Go over patterns. If one matches it's enough.\par
+  for k, pattern in pairs(plugin.patterns) do\par
+    local matches = match_pattern(pattern, msg.text)\par
+    if matches then\par
+      print("msg matches: ", pattern)\par
+\par
+      if is_plugin_disabled_on_chat(plugin_name, receiver) then\par
+        return nil\par
+      end\par
+      -- Function exists\par
+      if plugin.run then\par
+        -- If plugin is for privileged users only\par
+        if not warns_user_not_allowed(plugin, msg) then\par
+          local result = plugin.run(msg, matches)\par
+          if result then\par
+            send_large_msg(receiver, result)\par
+          end\par
+        end\par
+      end\par
+      -- One patterns matches\par
+      return\par
+    end\par
+  end\par
+end\par
+\par
+-- DEPRECATED, use send_large_msg(destination, text)\par
+function _send_msg(destination, text)\par
+  send_large_msg(destination, text)\par
+end\par
+\par
+-- Save the content of _config to config.lua\par
+function save_config( )\par
+  serialize_to_file(_config, './data/config.lua')\par
+  print ('saved config into ./data/config.lua')\par
+end\par
+\par
+-- Returns the config from config.lua file.\par
+-- If file doesn't exist, create it.\par
+function load_config( )\par
+  local f = io.open('./data/config.lua', "r")\par
+  -- If config.lua doesn't exist\par
+  if not f then\par
+    print ("Created new config file: data/config.lua")\par
+    create_config()\par
+  else\par
+    f:close()\par
+  end\par
+  local config = loadfile ("./data/config.lua")()\par
+  for v,user in pairs(config.sudo_users) do\par
+    print("Sudo user: " .. user)\par
+  end\par
+  return config\par
+end\par
+\par
+-- Create a basic config.json file and saves it.\par
+function create_config( )\par
+  -- A simple config with basic plugins and ourselves as privileged user\par
+  config = \{\par
+    enabled_plugins = \{\par
+\tab "admin",\par
+    "onservice",\par
+    "inrealm",\par
+    "ingroup",\par
+    "inpm",\par
+    "banhammer",\par
+    "stats",\par
+    "anti_spam",\par
+    "owners",\par
+    "arabic_lock",\par
+    "set",\par
+    "get",\par
+    "broadcast",\par
+    "invite",\par
+    "all",\par
+    "leave_ban",\par
+\tab "supergroup",\par
+\tab "whitelist",\par
+\tab "msg_checks"\par
+    \},\par
+    sudo_users = \{110626080,103649648,111020322,0,tonumber(our_id)\},--Sudo users\par
+    moderation = \{data = 'data/moderation.json'\},\par
+    about_text = [[Teleseed v4\par
+An advanced administration bot based on TG-CLI written in Lua\par
+\par
+{\field{\*\fldinst{HYPERLINK "https://github.com/devahmed2/deiviraq.gitAdmins"}}{\fldrslt{\ul\cf1 https://github.com/devahmed2/deiviraq.gitAdmins}}}\f0\fs22\par
+@Alani20011 [Founder]\par
+\par
+Special thanks to\par
+awkward_potato\par
+Siyanew\par
+topkecleon\par
+Vamptacus\par
+\par
+Our channels\par
+@teleseedch [English]\par
+@iranseed [persian]\par
+\par
+Our website \par
+{\field{\*\fldinst{HYPERLINK "http://technologyaliraqi.blogspot.com"}}{\fldrslt{\ul\cf1 http://technologyaliraqi.blogspot.com}}}\f0\fs22\par
+    help_text_realm = [[\par
+Realm Commands:\par
+\par
+!creategroup [Name]\par
+Create a group\par
+\par
+!createrealm [Name]\par
+Create a realm\par
+\par
+!setname [Name]\par
+Set realm name\par
+\par
+!setabout [group|sgroup] [GroupID] [Text]\par
+Set a group's about text\par
+\par
+!setrules [GroupID] [Text]\par
+Set a group's rules\par
+\par
+!lock [GroupID] [setting]\par
+Lock a group's setting\par
+\par
+!unlock [GroupID] [setting]\par
+Unock a group's setting\par
+\par
+!settings [group|sgroup] [GroupID]\par
+Set settings for GroupID\par
+\par
+!wholist\par
+Get a list of members in group/realm\par
+\par
+!who\par
+Get a file of members in group/realm\par
+\par
+!type\par
+Get group type\par
+\par
+!kill chat [GroupID]\par
+Kick all memebers and delete group\par
+\par
+!kill realm [RealmID]\par
+Kick all members and delete realm\par
+\par
+!addadmin [id|username]\par
+Promote an admin by id OR username *Sudo only\par
+\par
+!removeadmin [id|username]\par
+Demote an admin by id OR username *Sudo only\par
+\par
+!list groups\par
+Get a list of all groups\par
+\par
+!list realms\par
+Get a list of all realms\par
+\par
+!support\par
+Promote user to support\par
+\par
+!-support\par
+Demote user from support\par
+\par
+!log\par
+Get a logfile of current group or realm\par
+\par
+!broadcast [text]\par
+!broadcast Hello !\par
+Send text to all groups\par
+Only sudo users can run this command\par
+\par
+!bc [group_id] [text]\par
+!bc 123456789 Hello !\par
+This command will send text to [group_id]\par
+\par
+\par
+**You can use "#", "!", or "/" to begin all commands\par
+\par
+\par
+*Only admins and sudo can add bots in group\par
+\par
+\par
+*Only admins and sudo can use kick,ban,unban,newlink,setphoto,setname,lock,unlock,set rules,set about and settings commands\par
+\par
+*Only admins and sudo can use res, setowner, commands\par
+]],\par
+    help_text = [[\par
+Commands list :\par
+\par
+!kick [username|id]\par
+You can also do it by reply\par
+\par
+!ban [ username|id]\par
+You can also do it by reply\par
+\par
+!unban [id]\par
+You can also do it by reply\par
+\par
+!who\par
+Members list\par
+\par
+!modlist\par
+Moderators list\par
+\par
+!promote [username]\par
+Promote someone\par
+\par
+!demote [username]\par
+Demote someone\par
+\par
+!kickme\par
+Will kick user\par
+\par
+!about\par
+Group description\par
+\par
+!setphoto\par
+Set and locks group photo\par
+\par
+!setname [name]\par
+Set group name\par
+\par
+!rules\par
+Group rules\par
+\par
+!id\par
+return group id or user id\par
+\par
+!help\par
+Returns help text\par
+\par
+!lock [links|flood|spam|Arabic|member|rtl|sticker|contacts|strict]\par
+Lock group settings\par
+*rtl: Kick user if Right To Left Char. is in name*\par
+\par
+!unlock [links|flood|spam|Arabic|member|rtl|sticker|contacts|strict]\par
+Unlock group settings\par
+*rtl: Kick user if Right To Left Char. is in name*\par
+\par
+!mute [all|audio|gifs|photo|video]\par
+mute group message types\par
+*If "muted" message type: user is kicked if message type is posted \par
+\par
+!unmute [all|audio|gifs|photo|video]\par
+Unmute group message types\par
+*If "unmuted" message type: user is not kicked if message type is posted \par
+\par
+!set rules <text>\par
+Set <text> as rules\par
+\par
+!set about <text>\par
+Set <text> as about\par
+\par
+!settings\par
+Returns group settings\par
+\par
+!muteslist\par
+Returns mutes for chat\par
+\par
+!muteuser [username]\par
+Mute a user in chat\par
+*user is kicked if they talk\par
+*only owners can mute | mods and owners can unmute\par
+\par
+!mutelist\par
+Returns list of muted users in chat\par
+\par
+!newlink\par
+create/revoke your group link\par
+\par
+!link\par
+returns group link\par
+\par
+!owner\par
+returns group owner id\par
+\par
+!setowner [id]\par
+Will set id as owner\par
+\par
+!setflood [value]\par
+Set [value] as flood sensitivity\par
+\par
+!stats\par
+Simple message statistics\par
+\par
+!save [value] <text>\par
+Save <text> as [value]\par
+\par
+!get [value]\par
+Returns text of [value]\par
+\par
+!clean [modlist|rules|about]\par
+Will clear [modlist|rules|about] and set it to nil\par
+\par
+!res [username]\par
+returns user id\par
+"!res @username"\par
+\par
+!log\par
+Returns group logs\par
+\par
+!banlist\par
+will return group ban list\par
+\par
+**You can use "#", "!", or "/" to begin all commands\par
+\par
+\par
+*Only owner and mods can add bots in group\par
+\par
+\par
+*Only moderators and owner can use kick,ban,unban,newlink,link,setphoto,setname,lock,unlock,set rules,set about and settings commands\par
+\par
+*Only owner can use res,setowner,promote,demote and log commands\par
+\par
+]],\par
+\tab help_text_super =[[\par
+SuperGroup Commands:\par
+\par
+!info\par
+Displays general info about the SuperGroup\par
+\par
+!admins\par
+Returns SuperGroup admins list\par
+\par
+!owner\par
+Returns group owner\par
+\par
+!modlist\par
+Returns Moderators list\par
+\par
+!bots\par
+Lists bots in SuperGroup\par
+\par
+!who\par
+Lists all users in SuperGroup\par
+\par
+!block\par
+Kicks a user from SuperGroup\par
+*Adds user to blocked list*\par
+\par
+!ban\par
+Bans user from the SuperGroup\par
+\par
+!unban\par
+Unbans user from the SuperGroup\par
+\par
+!id\par
+Return SuperGroup ID or user id\par
+*For userID's: !id @username or reply !id*\par
+\par
+!id from\par
+Get ID of user message is forwarded from\par
+\par
+!kickme\par
+Kicks user from SuperGroup\par
+*Must be unblocked by owner or use join by pm to return*\par
+\par
+!setowner\par
+Sets the SuperGroup owner\par
+\par
+!promote [username|id]\par
+Promote a SuperGroup moderator\par
+\par
+!demote [username|id]\par
+Demote a SuperGroup moderator\par
+\par
+!setname\par
+Sets the chat name\par
+\par
+!setphoto\par
+Sets the chat photo\par
+\par
+!setrules\par
+Sets the chat rules\par
+\par
+!setabout\par
+Sets the about section in chat info(members list)\par
+\par
+!save [value] <text>\par
+Sets extra info for chat\par
+\par
+!get [value]\par
+Retrieves extra info for chat by value\par
+\par
+!newlink\par
+Generates a new group link\par
+\par
+!link\par
+Retireives the group link\par
+\par
+!rules\par
+Retrieves the chat rules\par
+\par
+!lock [links|flood|spam|Arabic|member|rtl|sticker|contacts|strict]\par
+Lock group settings\par
+*rtl: Delete msg if Right To Left Char. is in name*\par
+*strict: enable strict settings enforcement (violating user will be kicked)*\par
+\par
+!unlock [links|flood|spam|Arabic|member|rtl|sticker|contacts|strict]\par
+Unlock group settings\par
+*rtl: Delete msg if Right To Left Char. is in name*\par
+*strict: disable strict settings enforcement (violating user will not be kicked)*\par
+\par
+!mute [all|audio|gifs|photo|video|service]\par
+mute group message types\par
+*A "muted" message type is auto-deleted if posted\par
+\par
+!unmute [all|audio|gifs|photo|video|service]\par
+Unmute group message types\par
+*A "unmuted" message type is not auto-deleted if posted\par
+\par
+!setflood [value]\par
+Set [value] as flood sensitivity\par
+\par
+!settings\par
+Returns chat settings\par
+\par
+!muteslist\par
+Returns mutes for chat\par
+\par
+!muteuser [username]\par
+Mute a user in chat\par
+*If a muted user posts a message, the message is deleted automaically\par
+*only owners can mute | mods and owners can unmute\par
+\par
+!mutelist\par
+Returns list of muted users in chat\par
+\par
+!banlist\par
+Returns SuperGroup ban list\par
+\par
+!clean [rules|about|modlist|mutelist]\par
+\par
+!del\par
+Deletes a message by reply\par
+\par
+!public [yes|no]\par
+Set chat visibility in pm !chats or !chatlist commands\par
+\par
+!res [username]\par
+Returns users name and id by username\par
+\par
+\par
+!log\par
+Returns group logs\par
+*Search for kick reasons using [#RTL|#spam|#lockmember]\par
+\par
+**You can use "#", "!", or "/" to begin all commands\par
+\par
+*Only owner can add members to SuperGroup\par
+(use invite link to invite)\par
+\par
+*Only moderators and owner can use block, ban, unban, newlink, link, setphoto, setname, lock, unlock, setrules, setabout and settings commands\par
+\par
+*Only owner can use res, setowner, promote, demote, and log commands\par
+\par
+]],\par
+  \}\par
+  serialize_to_file(config, './data/config.lua')\par
+  print('saved config into ./data/config.lua')\par
+end\par
+\par
+function on_our_id (id)\par
+  our_id = id\par
+end\par
+\par
+function on_user_update (user, what)\par
+  --vardump (user)\par
+end\par
+\par
+function on_chat_update (chat, what)\par
+  --vardump (chat)\par
+end\par
+\par
+function on_secret_chat_update (schat, what)\par
+  --vardump (schat)\par
+end\par
+\par
+function on_get_difference_end ()\par
+end\par
+\par
+-- Enable plugins in config.json\par
+function load_plugins()\par
+  for k, v in pairs(_config.enabled_plugins) do\par
+    print("Loading plugin", v)\par
+\par
+    local ok, err =  pcall(function()\par
+      local t = loadfile("plugins/"..v..'.lua')()\par
+      plugins[v] = t\par
+    end)\par
+\par
+    if not ok then\par
+      print('\\27[31mError loading plugin '..v..'\\27[39m')\par
+\tab   print(tostring(io.popen("lua plugins/"..v..".lua"):read('*all')))\par
+      print('\\27[31m'..err..'\\27[39m')\par
+    end\par
+\par
+  end\par
+end\par
+\par
+-- custom add\par
+function load_data(filename)\par
+\par
+\tab local f = io.open(filename)\par
+\tab if not f then\par
+\tab\tab return \{\}\par
+\tab end\par
+\tab local s = f:read('*all')\par
+\tab f:close()\par
+\tab local data = JSON.decode(s)\par
+\par
+\tab return data\par
+\par
+end\par
+\par
+function save_data(filename, data)\par
+\par
+\tab local s = JSON.encode(data)\par
+\tab local f = io.open(filename, 'w')\par
+\tab f:write(s)\par
+\tab f:close()\par
+\par
+end\par
+\par
+\par
+-- Call and postpone execution for cron plugins\par
+function cron_plugins()\par
+\par
+  for name, plugin in pairs(plugins) do\par
+    -- Only plugins with cron function\par
+    if plugin.cron ~= nil then\par
+      plugin.cron()\par
+    end\par
+  end\par
+\par
+  -- Called again in 2 mins\par
+  postpone (cron_plugins, false, 120)\par
+end\par
+\par
+-- Start and load values\par
+our_id = 0\par
+now = os.time()\par
+math.randomseed(now)\par
+started = false\par
+}
+ 
